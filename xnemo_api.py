@@ -63,7 +63,6 @@ class GenerationConfig:
     height: int = 512
     steps: int = 25
     guidance_scale: float = 2.5
-    fps: int = 25
     seed: int = 42
     max_frames: Optional[int] = None
     context_frames: int = 24
@@ -282,7 +281,7 @@ class XNemoGenerator:
             print(f"  Source: {source_path}")
             print(f"  Output: {output}")
         
-        # Preprocess
+        # Preprocess (also returns source video FPS)
         data = self._preprocess(reference, source_path, config)
         
         # Generate
@@ -304,8 +303,8 @@ class XNemoGenerator:
                 decode_chunk_size=config.vae_batch_size,
             ).videos
         
-        # Save
-        save_videos_grid(video, output, n_rows=1, fps=config.fps, crf=18)
+        # Save using the source video's FPS for correct playback speed
+        save_videos_grid(video, output, n_rows=1, fps=data["fps"], crf=18)
         
         if self.verbose:
             elapsed = time.time() - start
@@ -315,7 +314,16 @@ class XNemoGenerator:
         return output
     
     def _preprocess(self, reference, source_path, config):
-        """Preprocess inputs for generation."""
+        """Preprocess inputs for generation.
+        
+        Returns a dict containing:
+            - ref_image: cropped reference face image (PIL)
+            - ref_pose: reference pose image (PIL)
+            - pose_images: list of pose images (PIL)
+            - bbox_params: tensor of bbox parameters
+            - generator: torch.Generator
+            - fps: source video frames-per-second (float)
+        """
         width, height = config.width, config.height
         
         transform = transforms.Compose([
@@ -343,7 +351,7 @@ class XNemoGenerator:
         
         # Load source video
         control = VideoReader(source_path)
-        fps = control.get_avg_fps()
+        fps = float(control.get_avg_fps())
         total = min(len(control), config.max_frames or len(control))
         
         if self.verbose:
@@ -406,11 +414,12 @@ class XNemoGenerator:
         pose_images = [r[1] for r in sorted(results, key=lambda x: x[0])]
         
         return {
-            'ref_image': ref_pil,
-            'ref_pose': ref_pose,
-            'pose_images': pose_images,
-            'bbox_params': bbox_params,
-            'generator': generator,
+            "ref_image": ref_pil,
+            "ref_pose": ref_pose,
+            "pose_images": pose_images,
+            "bbox_params": bbox_params,
+            "generator": generator,
+            "fps": fps,
         }
     
     @staticmethod
@@ -508,7 +517,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--fps", type=int, default=25)
     
     args = parser.parse_args()
     
@@ -517,7 +525,6 @@ if __name__ == "__main__":
         height=args.height,
         steps=args.steps,
         guidance_scale=args.guidance,
-        fps=args.fps,
         max_frames=args.max_frames,
         seed=args.seed,
     )

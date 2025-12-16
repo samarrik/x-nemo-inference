@@ -61,7 +61,8 @@ python xnemo_api.py \
 | `--seed` | 42 | Random seed |
 | `--width` | 512 | Output width |
 | `--height` | 512 | Output height |
-| `--fps` | 25 | Output FPS |
+
+**Note**: The output video's FPS automatically matches the source video's FPS for natural playback speed. There is no separate FPS override option.
 
 ## Apptainer Container (Cluster)
 

@@ -42,7 +42,6 @@ def main():
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--guidance", type=float, default=2.5)
-    parser.add_argument("--fps", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-frames", type=int, default=None)
 
@@ -76,7 +75,6 @@ def main():
         height=args.height,
         steps=args.steps,
         guidance_scale=args.guidance,
-        fps=args.fps,
         seed=args.seed,
         max_frames=args.max_frames,
     )
