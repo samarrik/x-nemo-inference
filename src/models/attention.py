@@ -11,15 +11,18 @@
 # This modified file is released under the same license.
 # *************************************************************************
 from typing import Any, Dict, Optional
+import math
 
 import torch
-from diffusers.models.attention import AdaLayerNorm, Attention, FeedForward
+import torch.nn.functional as F
+from diffusers.models.attention import AdaLayerNorm, Attention, FeedForward, GatedSelfAttentionDense
+from diffusers.models.attention_processor import AttnProcessor
 from diffusers.models.embeddings import SinusoidalPositionalEmbedding
-from einops import rearrange
+from diffusers.models.normalization import AdaLayerNormZero
 from torch import nn
 
-from diffusers.models.attention import *
-from diffusers.models.attention_processor import *  
+# Check for SDPA availability (Flash Attention backend)
+HAS_SDPA = hasattr(F, 'scaled_dot_product_attention')  
 
 class BasicTransformerBlock(nn.Module):
     r"""
@@ -441,18 +444,24 @@ class TemporalBasicTransformerBlock(nn.Module):
         # Feed-forward
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
-        # Temporal-Attention
+        # Temporal-Attention (optimized without einops)
         if self.unet_use_temporal_attention:
             d = hidden_states.shape[1]
-            hidden_states = rearrange(
-                hidden_states, "(b f) d c -> (b d) f c", f=video_length
-            )
+            c = hidden_states.shape[2]
+            bf = hidden_states.shape[0]
+            b = bf // video_length
+            
+            # (b f) d c -> (b d) f c
+            hidden_states = hidden_states.view(b, video_length, d, c).permute(0, 2, 1, 3).reshape(b * d, video_length, c)
+            
             norm_hidden_states = (
                 self.norm_temp(hidden_states, timestep)
                 if self.use_ada_layer_norm
                 else self.norm_temp(hidden_states)
             )
             hidden_states = self.attn_temp(norm_hidden_states) + hidden_states
-            hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+            
+            # (b d) f c -> (b f) d c
+            hidden_states = hidden_states.view(b, d, video_length, c).permute(0, 2, 1, 3).reshape(b * video_length, d, c)
 
         return hidden_states

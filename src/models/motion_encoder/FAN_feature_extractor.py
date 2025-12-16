@@ -172,7 +172,6 @@ class FAN_use(nn.Module):
         return net
 
 from .FAN_temporal_feature_extractor import TemporalTransformer3DModel
-from einops import rearrange
 
 
 class FAN_SA(nn.Module):
@@ -213,12 +212,10 @@ class FAN_SA(nn.Module):
         self.avgpool = nn.MaxPool2d((2, 2), 2)
         self.conv6 = nn.Conv2d(68, 1, 3, 2, 1)
         self.fc = nn.Linear(28 * 28, 512)
-        # self.conv6 = nn.Conv2d(68, 2, 3, 2, 1)
-        # self.fc = nn.Linear(28 * 28 * 2, 1024)
         self.bn5 = nn.BatchNorm2d(68)
         self.relu = nn.ReLU(True)
 
-        # Add by zxc
+        # Attention modules
         self.att_1 = TemporalTransformer3DModel(
             in_channels=128,
             sample_size=112,
@@ -245,16 +242,16 @@ class FAN_SA(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)), True)  # 112
         x = self.conv2(x)  # [B, 128, 112, 112]
 
-        # Temp Self-Att: [B*h*w, T, 128*p*p] [B*28*28, T, 1024]
-        x = rearrange(x, "(b f) c h w -> b c f h w", f=1)
+        # Add temporal dimension: B c h w -> B c 1 h w (optimized without einops)
+        x = x.unsqueeze(2)
         x = self.att_1(x, skip=True)[:, :, 0]
 
         x = F.max_pool2d(x, 2)  # 56
         x = self.conv3(x)
         x = self.conv4(x)  # [B, 256, 56, 56]
 
-        # Temp Self-Att: [B*h*w, T, 256*p*p] [B*28*28, T, 1024]
-        x = rearrange(x, "(b f) c h w -> b c f h w", f=1)
+        # Add temporal dimension
+        x = x.unsqueeze(2)
         x = self.att_2(x, skip=True)[:, :, 0]
 
         previous = x
@@ -268,10 +265,10 @@ class FAN_SA(nn.Module):
         ll = self._modules['bn_end' + str(i)](
             self._modules['conv_last' + str(i)](ll)
         )  # [B, 256, 56, 56]
-        # Temp Cross-Att: [B*28*28, 1, 1024]*[B*28*28, T, 1024]
-        ll = rearrange(ll, "(b f) c h w -> b c f h w", f=1)
-        ll = self.att_3(ll, skip=True)[:, :, 0]  # "b c 1 h w -> b c h w"
-        # print('att3', torch.abs(ll).mean().item())
+        
+        # Add temporal dimension
+        ll = ll.unsqueeze(2)
+        ll = self.att_3(ll, skip=True)[:, :, 0]
 
         tmp_out = self._modules['l' + str(i)](F.relu(ll))
 

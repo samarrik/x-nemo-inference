@@ -14,7 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PatchEmbed
 
-from einops import rearrange
 from src.models.motion_module import TemporalTransformerBlock, zero_module, random_module
 
 def conv3x3(in_planes, out_planes, strd=1, padding=1, bias=False):
@@ -188,31 +187,35 @@ class TemporalTransformer3DModel(nn.Module):
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, skip=True):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
-        batch, _, video_length = hidden_states.shape[:3]
+        batch, channels, video_length, h, w = hidden_states.shape
         residual = hidden_states
-        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+        
+        # Optimized reshape: b c f h w -> (b f) c h w
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(batch * video_length, channels, h, w)
 
         _, _, height, width = hidden_states.shape
 
-        hidden_states = self.norm(hidden_states)  # 需要先norm，再加posEmb，否则Emb偏执太大了
-        grid_h, grid_w =  height // self.patch_size, width // self.patch_size,
+        hidden_states = self.norm(hidden_states)
+        grid_h, grid_w = height // self.patch_size, width // self.patch_size
 
-        hidden_states = self.pos_embed(hidden_states)  # [(bf), l, c]  # 偏执太大了
-        # print(
-        #     round(torch.abs(hidden_states).mean().item(), 6),
-        #     round(torch.abs(norm_hidden_states).mean().item(), 6),
-        # )
+        hidden_states = self.pos_embed(hidden_states)  # [(bf), l, c]
+        
         if self.cross_frame_attention_mode is not None:
             assert encoder_hidden_states is None
-            encoder_hidden_states = rearrange(hidden_states, "(b f) d c -> b f d c", b=batch)
+            d = hidden_states.shape[1]
+            c = hidden_states.shape[2]
+            # (b f) d c -> b f d c
+            encoder_hidden_states = hidden_states.view(batch, video_length, d, c)
 
-            hidden_states = encoder_hidden_states[:, -1] # [b, d, c]
+            hidden_states = encoder_hidden_states[:, -1]  # [b, d, c]
             residual = residual[:, :, -1:]
             video_length = 1
-            if self.cross_frame_attention_mode == 'Temporal': # 用所有帧来condition最后一帧（当前帧）
-                encoder_hidden_states = rearrange(encoder_hidden_states, "b f d c -> (b d) f c")
+            if self.cross_frame_attention_mode == 'Temporal':
+                # b f d c -> (b d) f c
+                encoder_hidden_states = encoder_hidden_states.permute(0, 2, 1, 3).reshape(batch * d, -1, c)
             elif self.cross_frame_attention_mode == 'Spatial':
-                encoder_hidden_states = rearrange(encoder_hidden_states, "b f d c -> b (f d) c")
+                # b f d c -> b (f d) c
+                encoder_hidden_states = encoder_hidden_states.reshape(batch, -1, c)
 
         # Transformer Blocks
         for block in self.transformer_blocks:
@@ -220,7 +223,6 @@ class TemporalTransformer3DModel(nn.Module):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 video_length=video_length,
-                att_flag=False
             )
 
         hidden_states = hidden_states.reshape(
@@ -230,12 +232,9 @@ class TemporalTransformer3DModel(nn.Module):
         hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
         hidden_states = hidden_states.reshape(shape=(batch * video_length, self.in_channels, height, width))
 
-        hidden_states = rearrange(hidden_states, "(b f) c h w -> b c f h w", b=batch)
-        # print(
-        #     'out',
-        #     round(torch.abs(hidden_states).mean().item(), 6),
-        #     round(torch.abs(residual).mean().item(), 6),
-        # )
+        # Optimized reshape: (b f) c h w -> b c f h w
+        hidden_states = hidden_states.view(batch, video_length, self.in_channels, height, width).permute(0, 2, 1, 3, 4)
+        
         output = (hidden_states + residual) if skip else hidden_states
 
         return output

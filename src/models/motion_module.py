@@ -14,12 +14,16 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention, AttnProcessor
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange, repeat
 from torch import nn
+
+# Check for Flash Attention / SDPA availability
+HAS_FLASH_ATTN = hasattr(F, 'scaled_dot_product_attention')
 
 
 def zero_module(module):
@@ -123,21 +127,18 @@ class VanillaTemporalModule(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         anchor_frame_idx=None,
-        debug=False
     ):
         hidden_states = input_tensor
         if self.skip_ref_image:
-            # if input_tensor.shape[2] > 1:
-                hidden_states, ref_hidden_states = input_tensor[:, :, :-1], input_tensor[:, :, -1:]
+            hidden_states, ref_hidden_states = input_tensor[:, :, :-1], input_tensor[:, :, -1:]
 
         hidden_states = self.temporal_transformer(
-            hidden_states, encoder_hidden_states, attention_mask, debug=debug
+            hidden_states, encoder_hidden_states, attention_mask
         )
 
         output = hidden_states
         if self.skip_ref_image:
-            # if input_tensor.shape[2] > 1:
-                output = torch.cat([output, ref_hidden_states], dim=2)
+            output = torch.cat([output, ref_hidden_states], dim=2)
         elif self.cond_ref_image:
             output = torch.cat([output[:, :, :-1], input_tensor[:, :, -1:]], dim=2)
         return output
@@ -195,16 +196,18 @@ class TemporalTransformer3DModel(nn.Module):
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, debug=False):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
         assert (
             hidden_states.dim() == 5
         ), f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         video_length = hidden_states.shape[2]
-        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+        batch_frames = hidden_states.shape[0] * video_length
+        
+        # Optimized reshape: avoid einops overhead
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(batch_frames, -1, hidden_states.shape[3], hidden_states.shape[4])
 
         if encoder_hidden_states is not None and encoder_hidden_states.ndim == 4:
-            assert encoder_hidden_states.shape[1] == video_length, (video_length, encoder_hidden_states.shape)
-            encoder_hidden_states = rearrange(encoder_hidden_states, "b d n c -> (b d) n c",)
+            encoder_hidden_states = encoder_hidden_states.permute(0, 1, 2, 3).reshape(-1, encoder_hidden_states.shape[2], encoder_hidden_states.shape[3])
 
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
@@ -231,20 +234,14 @@ class TemporalTransformer3DModel(nn.Module):
             .permute(0, 3, 1, 2)
             .contiguous()
         )
-        if False:
-            print(
-                'TemporalModule',
-                hidden_states.shape,
-                # round(torch.abs(residual).mean().item(), 6),
-                # round(torch.abs(residual).max().item(), 6),
-                # round(torch.abs(hidden_states).mean().item(), 6),
-                # round(torch.abs(hidden_states).max().item(), 6),
-            )
-            # hidden_states *= 0
-        output = hidden_states + residual
-        output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
+        
+        # In-place add for efficiency
+        hidden_states = hidden_states + residual
+        
+        # Optimized reshape back
+        hidden_states = hidden_states.reshape(-1, video_length, channel, height, weight).permute(0, 2, 1, 3, 4)
 
-        return output
+        return hidden_states
 
 
 class TemporalTransformerBlock(nn.Module):
@@ -308,16 +305,9 @@ class TemporalTransformerBlock(nn.Module):
         encoder_hidden_states=None,
         attention_mask=None,
         video_length=None,
-        att_flag=False
     ):
         for attention_block, norm in zip(self.attention_blocks, self.norms):
             norm_hidden_states = norm(hidden_states)
-            if att_flag:
-                print(
-                    'block',
-                    round(torch.abs(hidden_states).mean().item(), 6),
-                    round(torch.abs(norm_hidden_states).mean().item(), 6),
-                )
             hidden_states = (
                 attention_block(
                     norm_hidden_states,
@@ -325,7 +315,6 @@ class TemporalTransformerBlock(nn.Module):
                     if attention_block.is_cross_attention
                     else None,
                     video_length=video_length,
-                    att_flag=att_flag
                 )
                 + hidden_states
             )
@@ -354,6 +343,64 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class SDPAAttnProcessor:
+    """
+    Optimized attention processor using PyTorch 2.0 SDPA (Scaled Dot Product Attention).
+    Falls back to standard attention if SDPA is not available.
+    """
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, _ = hidden_states.shape
+        
+        query = attn.to_q(hidden_states)
+        
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        
+        # Reshape for multi-head attention
+        head_dim = attn.heads
+        inner_dim = key.shape[-1]
+        
+        query = query.view(batch_size, -1, head_dim, inner_dim // head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, head_dim, inner_dim // head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, head_dim, inner_dim // head_dim).transpose(1, 2)
+        
+        # Use SDPA if available (Flash Attention when possible)
+        if HAS_FLASH_ATTN:
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            # Fallback to standard attention
+            scale = 1 / math.sqrt(inner_dim // head_dim)
+            attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scale
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            hidden_states = torch.matmul(attn_weights, value)
+        
+        # Reshape back
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, inner_dim)
+        
+        # Output projection
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        
+        return hidden_states
+
+
 class VersatileAttention(Attention):
     def __init__(
         self,
@@ -369,6 +416,10 @@ class VersatileAttention(Attention):
 
         self.attention_mode = attention_mode
         self.is_cross_attention = kwargs["cross_attention_dim"] is not None
+        
+        # Use SDPA processor by default for better performance
+        if HAS_FLASH_ATTN:
+            self.set_processor(SDPAAttnProcessor())
 
         self.pos_encoder = (
             PositionalEncoding(
@@ -413,15 +464,10 @@ class VersatileAttention(Attention):
                 except Exception as e:
                     raise e
 
-            # XFormersAttnProcessor corrupts video generation and work with Pytorch 1.13.
-            # Pytorch 2.0.1 AttnProcessor works the same as XFormersAttnProcessor in Pytorch 1.13.
-            # You don't need XFormersAttnProcessor here.
-            # processor = XFormersAttnProcessor(
-            #     attention_op=attention_op,
-            # )
-            processor = AttnProcessor()
+            # Use SDPA processor (equivalent to xformers in PyTorch 2.0+)
+            processor = SDPAAttnProcessor() if HAS_FLASH_ATTN else AttnProcessor()
         else:
-            processor = AttnProcessor()
+            processor = SDPAAttnProcessor() if HAS_FLASH_ATTN else AttnProcessor()
 
         self.set_processor(processor)
 
@@ -432,19 +478,21 @@ class VersatileAttention(Attention):
         attention_mask=None,
         video_length=None,
         bank=None,
-        att_flag=False,
         **cross_attention_kwargs,
     ):
         if self.attention_mode == "Temporal":
             d = hidden_states.shape[1]  # d means HxW
-            hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
+            # Optimized reshape without einops
+            b_f = hidden_states.shape[0]
+            b = b_f // video_length
+            hidden_states = hidden_states.view(b, video_length, d, -1).permute(0, 2, 1, 3).reshape(b * d, video_length, -1)
 
             if encoder_hidden_states is not None:
-                if not encoder_hidden_states.shape[0] == hidden_states.shape[0]:
-                    encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d)
+                if encoder_hidden_states.shape[0] != hidden_states.shape[0]:
+                    encoder_hidden_states = encoder_hidden_states.unsqueeze(1).expand(-1, d, -1, -1).reshape(b * d, -1, encoder_hidden_states.shape[-1])
 
         if bank is not None and self.attention_mode == "Temporal" and not self.is_cross_attention:
-            # motion_frames作为之前的帧，引入motion module进行condition
+            # Concatenate bank features for conditioning
             modify_norm_hidden_states = torch.cat(bank + [hidden_states], dim=1)    
 
             if self.pos_encoder is not None:
@@ -456,12 +504,12 @@ class VersatileAttention(Attention):
                 encoder_hidden_states=modify_norm_hidden_states,
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
-            )  # 改为cross-att
+            )
 
         else:
             if self.pos_encoder is not None:
                 hidden_states = self.pos_encoder(hidden_states)
-            inp = hidden_states
+            
             hidden_states = self.processor(
                 self,
                 hidden_states,
@@ -469,15 +517,9 @@ class VersatileAttention(Attention):
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
             )
-            if att_flag:
-                print(
-                    'ver_att',
-                    round(torch.abs(inp).mean().item(), 6),
-                    round(torch.abs(encoder_hidden_states).mean().item(), 6),
-                    round(torch.abs(hidden_states).mean().item(), 6),
-                )
 
         if self.attention_mode == "Temporal":
-            hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+            # Optimized reshape back without einops
+            hidden_states = hidden_states.view(b, d, video_length, -1).permute(0, 2, 1, 3).reshape(b * video_length, d, -1)
 
         return hidden_states

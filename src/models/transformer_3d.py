@@ -17,7 +17,6 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
-from einops import rearrange, repeat
 from torch import nn
 
 from .attention import TemporalBasicTransformerBlock
@@ -33,6 +32,19 @@ if is_xformers_available():
     import xformers.ops
 else:
     xformers = None
+
+
+def _rearrange_bcfhw_to_bfchw(x: torch.Tensor) -> torch.Tensor:
+    """Optimized b c f h w -> (b f) c h w without einops."""
+    b, c, f, h, w = x.shape
+    return x.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w)
+
+
+def _rearrange_bfchw_to_bcfhw(x: torch.Tensor, f: int) -> torch.Tensor:
+    """Optimized (b f) c h w -> b c f h w without einops."""
+    bf, c, h, w = x.shape
+    b = bf // f
+    return x.reshape(b, f, c, h, w).permute(0, 2, 1, 3, 4)
 
 
 class Transformer3DModel(ModelMixin, ConfigMixin):
@@ -119,16 +131,22 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         return_dict: bool = True,
         **block_kwargs,
     ):
-        # Input
+        # Input validation
         assert (
             hidden_states.dim() == 5
         ), f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
+        
         video_length = hidden_states.shape[2]
-        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+        
+        # Optimized reshape: b c f h w -> (b f) c h w
+        hidden_states = _rearrange_bcfhw_to_bfchw(hidden_states)
+        
+        # Expand encoder_hidden_states if needed
         if encoder_hidden_states.shape[0] != hidden_states.shape[0]:
-            encoder_hidden_states = repeat(
-                encoder_hidden_states, "b n c -> (b f) n c", f=video_length
-            )
+            # b n c -> (b f) n c
+            encoder_hidden_states = encoder_hidden_states.unsqueeze(1).expand(
+                -1, video_length, -1, -1
+            ).reshape(-1, encoder_hidden_states.shape[1], encoder_hidden_states.shape[2])
 
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
@@ -147,8 +165,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             )
             hidden_states = self.proj_in(hidden_states)
 
-        # Blocks
-        for i, block in enumerate(self.transformer_blocks):
+        # Transformer Blocks
+        for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -157,7 +175,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 **block_kwargs
             )
 
-        # Output
+        # Output projection
         if not self.use_linear_projection:
             hidden_states = (
                 hidden_states.reshape(batch, height, weight, inner_dim)
@@ -173,9 +191,12 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 .contiguous()
             )
 
+        # Residual connection
         output = hidden_states + residual
 
-        output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
+        # Optimized reshape back: (b f) c h w -> b c f h w
+        output = _rearrange_bfchw_to_bcfhw(output, video_length)
+        
         if not return_dict:
             return (output,)
 

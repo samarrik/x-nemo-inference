@@ -9,7 +9,6 @@
 #
 # This modified file is released under the same license.
 # *************************************************************************
-import pdb
 from typing import Dict, Optional
 import torch
 from torch import nn
@@ -380,7 +379,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                     else hidden_states
                 )
                 hidden_states = (
-                    temporal_module(hidden_states, temb, encoder_hidden_states=None, debug=True)
+                    temporal_module(hidden_states, temb, encoder_hidden_states=None)
                     if (temporal_module is not None) and not skip_mm
                     else hidden_states
                 )
@@ -589,7 +588,7 @@ class CrossAttnDownBlock3D(nn.Module):
                     else hidden_states
                 )
                 hidden_states = (
-                    temporal_module(hidden_states, temb, encoder_hidden_states=None, debug=True)
+                    temporal_module(hidden_states, temb, encoder_hidden_states=None)
                     if (temporal_module is not None) and not skip_mm
                     else hidden_states
                 )
@@ -744,9 +743,7 @@ class DownBlock3D(nn.Module):
                     else hidden_states
                 )
                 hidden_states = (
-                    temporal_module(
-                        hidden_states, temb, encoder_hidden_states=None, debug=True
-                    )
+                    temporal_module(hidden_states, temb, encoder_hidden_states=None)
                     if (temporal_module is not None) and not skip_mm
                     else hidden_states
                 )
@@ -956,7 +953,7 @@ class CrossAttnUpBlock3D(nn.Module):
 
                 # add temporal_module
                 hidden_states = (
-                    temporal_module(hidden_states, temb, encoder_hidden_states=None, debug=True)
+                    temporal_module(hidden_states, temb, encoder_hidden_states=None)
                     if (temporal_module is not None) and not skip_mm
                     else hidden_states
                 )
@@ -1109,7 +1106,7 @@ class UpBlock3D(nn.Module):
                     else hidden_states
                 )
                 hidden_states = (
-                    temporal_module(hidden_states, temb, encoder_hidden_states=None, debug=True)
+                    temporal_module(hidden_states, temb, encoder_hidden_states=None)
                     if (temporal_module is not None) and not skip_mm
                     else hidden_states
                 )
