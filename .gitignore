@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# Models and weights - downloaded by user
+pretrained_weights/
+*.pth
+*.onnx
+*.pt
+
+# Data - user provides their own
+datasets/
+data/
+
+# Output - generated videos
+output/
+results/
+
+# Container images
+*.sif
+
+# Logs and temp
+*.log
+logs/
+tmp/
+temp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

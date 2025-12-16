@@ -1,0 +1,100 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Author X-NeMo
+    Version 1.0
+    Description X-NeMo Video Generation Container
+
+%environment
+    export PYTHONPATH=/app:$PYTHONPATH
+    export PYTHONNOUSERSITE=1
+
+%post
+    # Basic system packages only (CUDA/ffmpeg via module load on cluster)
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3-pip \
+        python3.10-venv \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Create app directory
+    mkdir -p /app
+    cd /app
+
+    # Upgrade pip
+    python3 -m pip install --upgrade pip
+
+    # Install PyTorch (will use cluster CUDA via module load)
+    pip3 install torch==2.2.0 torchvision==0.17.0
+
+    # Install other dependencies
+    pip3 install \
+        accelerate==0.27.2 \
+        decord==0.6.0 \
+        diffusers==0.27.0 \
+        einops==0.8.1 \
+        mediapipe==0.10.11 \
+        numpy==1.26.3 \
+        omegaconf==2.3.0 \
+        opencv-contrib-python==4.9.0.80 \
+        opencv-python==4.10.0.84 \
+        Pillow==11.1.0 \
+        safetensors==0.5.3 \
+        scipy==1.13.1 \
+        scikit-image==0.22.0 \
+        tqdm==4.66.2 \
+        transformers==4.38.1 \
+        xformers==0.0.24 \
+        huggingface_hub==0.21.0
+
+    # Clean up
+    pip3 cache purge
+    apt-get clean
+
+%files
+    src /app/src
+    configs /app/configs
+    xnemo_api.py /app/xnemo_api.py
+    blaze_face_short_range.tflite /app/blaze_face_short_range.tflite
+
+%runscript
+    cd /app
+    exec python3 xnemo_api.py "$@"
+
+%help
+    X-NeMo Video Generation Container
+
+    Before running, load cluster modules:
+        module load CUDA/12.2.0
+        module load FFmpeg
+
+    Build:
+        apptainer build xnemo.sif xnemo.def
+
+    Run:
+        apptainer run --nv --bind /path/to/weights:/app/pretrained_weights \
+            --bind /path/to/data:/data \
+            xnemo.sif --source /data/motion.mp4 --reference /data/face.jpg --output /data/output.mp4
+
+    Interactive:
+        apptainer shell --nv --bind /path/to/weights:/app/pretrained_weights xnemo.sif
+
+    Arguments:
+        --source      User's uploaded video (motion source)
+        --reference   Identity's face image
+        --output      Reenacted video output
+
+    Required binds:
+        - pretrained_weights/ containing:
+          - sd-image-variations-diffusers/
+          - stable-video-diffusion-img2vid-xt/vae/
+          - xnemo_denoising_unet.pth
+          - xnemo_reference_unet.pth
+          - xnemo_motion_encoder.pth
+          - xnemo_temporal_module.pth
