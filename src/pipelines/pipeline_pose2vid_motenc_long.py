@@ -214,7 +214,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
         context_overlap: int = 8,
         context_batch_size: int = 1,
         interpolation_factor: int = 1,
-        decode_chunk_size: int = 16,
+        decode_chunk_size: int = 32,
         use_cuda_graph: bool = False,
         **kwargs,
     ):
@@ -284,7 +284,7 @@ class Pose2VideoPipeline(DiffusionPipeline):
         mot_bbox_param = mot_bbox_param.to(device=device, dtype=dtype)
         
         # Batch compute ALL motion embeddings at once with larger batches
-        motion_batch_size = 128  # Increased batch size for efficiency
+        motion_batch_size = 256  # Maximized batch size for efficiency
         all_motion_emb = []
         
         with torch.cuda.amp.autocast(enabled=(dtype == torch.float16)):

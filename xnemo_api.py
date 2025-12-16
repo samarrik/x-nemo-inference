@@ -69,7 +69,7 @@ class GenerationConfig:
     context_frames: int = 24
     context_overlap: int = 8
     context_batch_size: int = 1
-    vae_batch_size: int = 16
+    vae_batch_size: int = 32  # Increased for faster decoding
     num_workers: int = 4
 
 
@@ -123,17 +123,26 @@ class XNemoGenerator:
             print(f"{'=' * 50}")
     
     def _setup_cuda(self):
-        """Setup CUDA optimizations."""
+        """Setup CUDA optimizations for maximum speed."""
         if torch.cuda.is_available():
+            # Enable TF32 for faster matrix operations on Ampere+ GPUs
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            
+            # Enable cuDNN autotuning for optimal kernel selection
             torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False  # Faster, non-deterministic
+            
             torch.set_default_dtype(torch.float16)
             
+            # Enable all SDPA backends for maximum flexibility
             if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
                 torch.backends.cuda.enable_flash_sdp(True)
                 torch.backends.cuda.enable_math_sdp(True)
                 torch.backends.cuda.enable_mem_efficient_sdp(True)
+            
+            # Disable gradient computation globally for inference
+            torch.set_grad_enabled(False)
             
             if self.verbose:
                 gpu = torch.cuda.get_device_name(self.device)
@@ -215,7 +224,22 @@ class XNemoGenerator:
         ).to(self.device, dtype=self.weight_dtype)
         
         self.pipe.enable_vae_slicing()
+        self.pipe.enable_vae_tiling()
         self.pipe.enable_xformers_memory_efficient_attention()
+        
+        # Apply torch.compile for faster inference (PyTorch 2.0+)
+        if hasattr(torch, 'compile'):
+            try:
+                self.denoising_unet = torch.compile(
+                    self.denoising_unet, 
+                    mode="reduce-overhead",
+                    fullgraph=False
+                )
+                if self.verbose:
+                    print("✓ torch.compile enabled for UNet")
+            except Exception as e:
+                if self.verbose:
+                    print(f"⚠ torch.compile not available: {e}")
         
         if self.verbose:
             print(f"✓ Models loaded")
@@ -478,7 +502,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", required=True, help="User's uploaded video (motion source)")
     parser.add_argument("--reference", required=True, help="Identity's face image")
     parser.add_argument("--output", required=True, help="Reenacted video output")
-    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--guidance", type=float, default=2.5)
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
